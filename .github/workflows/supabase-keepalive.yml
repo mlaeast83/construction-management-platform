@@ -1,0 +1,67 @@
+name: Supabase keep-alive
+
+# Supabase pauses Free projects that show too little database activity
+# over 7 days. A read every 3 days was not enough (the project was paused
+# on 2026-11-26 despite successful runs), so this job now runs daily and
+# performs a real write through public.keep_alive_ping(), plus a read.
+# It runs from this PUBLIC repository because Actions minutes are free and
+# unlimited for public repositories (the private app repository ran out of
+# included minutes in November 2026). The publishable key is public by design.
+# GitHub disables scheduled workflows in public repositories after 60 days
+# without activity, so the last step re-enables this workflow each run.
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # every day at 06:17 UTC
+    - cron: "43 18 * * *" # and every day at 18:43 UTC
+  workflow_dispatch: # allows a manual run from the Actions tab
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # Public values (already in .env.example). Can be overridden with
+      # repository variables of the same name.
+      SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://nwwsopsjpgfwbscbanep.supabase.co' }}
+      SUPABASE_PUBLISHABLE_KEY: ${{ vars.SUPABASE_PUBLISHABLE_KEY || 'sb_publishable_JiZolWn5uB_xEUIzZlyJOw_QzAxWlPQ' }}
+    steps:
+      - name: Write a heartbeat to the database
+        run: |
+          status=$(curl -sS -o ping.txt -w "%{http_code}" \
+            --retry 3 --retry-delay 10 \
+            -X POST "$SUPABASE_URL/rest/v1/rpc/keep_alive_ping" \
+            -H "apikey: $SUPABASE_PUBLISHABLE_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          echo "Heartbeat HTTP status: $status"
+          cat ping.txt; echo
+          if [ "$status" -ge 400 ]; then
+            echo "::error::Heartbeat write failed (HTTP $status). If the project is paused, restore it from the dashboard. If the function is missing, apply migration 20261126080000_add_keep_alive_heartbeat.sql."
+            exit 1
+          fi
+
+      - name: Query the database through the REST API
+        run: |
+          status=$(curl -sS -o response.txt -w "%{http_code}" \
+            --retry 3 --retry-delay 10 \
+            "$SUPABASE_URL/rest/v1/projects?select=id&limit=1" \
+            -H "apikey: $SUPABASE_PUBLISHABLE_KEY")
+          echo "HTTP status: $status"
+          cat response.txt; echo
+          if [ "$status" -ge 400 ]; then
+            echo "::error::Supabase did not respond normally (HTTP $status). The project may be paused - restore it from the dashboard."
+            exit 1
+          fi
+
+      - name: Keep this scheduled workflow enabled
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/supabase-keepalive.yml/enable" \
+            || echo "::warning::Could not refresh the workflow's enabled state"
